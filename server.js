@@ -2,6 +2,7 @@ const express = require('express');
 const session = require('express-session');
 const helmet = require('helmet');
 const cors = require('cors');
+const crypto = require('crypto');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
@@ -12,9 +13,15 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SESSION_SECRET = process.env.SESSION_SECRET;
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env');
+  process.exit(1);
+}
+if (process.env.NODE_ENV === 'production' && !SESSION_SECRET) {
+  console.error('Missing SESSION_SECRET in production');
   process.exit(1);
 }
 
@@ -47,6 +54,37 @@ function cleanImageUrl(imageUrl, name, category, color) {
 
 function toBool(value) {
   return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+function verifyPassword(password, storedHash) {
+  const raw = String(storedHash || '');
+  if (!raw.includes(':')) return false;
+  const [salt, key] = raw.split(':');
+  const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(key, 'hex'), Buffer.from(derived, 'hex'));
+}
+
+const requestBuckets = new Map();
+function createLimiter({ windowMs, max }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = `${req.ip}:${req.path}`;
+    const bucket = requestBuckets.get(key) || { count: 0, resetAt: now + windowMs };
+    if (now > bucket.resetAt) {
+      bucket.count = 0;
+      bucket.resetAt = now + windowMs;
+    }
+    bucket.count += 1;
+    requestBuckets.set(key, bucket);
+    if (bucket.count > max) return res.status(429).json({ error: 'Too many requests, please try again later.' });
+    next();
+  };
 }
 
 function handleError(res, error, fallback = 'Server error') {
@@ -167,11 +205,20 @@ function requireAdmin(req, res, next) {
 
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy:false }));
-app.use(cors({ origin:true, credentials:true }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (!CORS_ORIGINS.length || CORS_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error('Origin not allowed by CORS'));
+  },
+  credentials:true
+}));
 app.use(express.json({ limit:'10mb' }));
 app.use(express.urlencoded({ extended:true }));
+const authLimiter = createLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
+const adminLimiter = createLimiter({ windowMs: 15 * 60 * 1000, max: 300 });
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'aura_demo_secret_change_this',
+  secret: SESSION_SECRET || 'dev_only_change_me_immediately',
   resave:false,
   saveUninitialized:false,
   cookie:{ httpOnly:true, sameSite:'lax', secure: process.env.NODE_ENV === 'production' ? true : 'auto', maxAge:1000*60*60*24*7 }
@@ -179,18 +226,20 @@ app.use(session({
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Auth
-app.post('/api/auth/register', async (req,res) => {
+app.post('/api/auth/register', authLimiter, async (req,res) => {
   try {
     const { name, email, password } = req.body;
     if(!name || !email || !password) return res.status(400).json({ error:'All fields are required' });
+    if (String(password).length < 8) return res.status(400).json({ error:'Password must be at least 8 characters' });
 
     const { data: existing } = await supabase.from('users').select('id').ilike('email', String(email).trim()).maybeSingle();
     if(existing) return res.status(409).json({ error:'Email already registered' });
 
+    const passwordHash = hashPassword(password);
     const { data: user, error } = await supabase.from('users').insert({
       name: String(name).trim(),
       email: String(email).trim().toLowerCase(),
-      password,
+      password: passwordHash,
       role: 'customer',
       is_active: true
     }).select('*').single();
@@ -202,7 +251,7 @@ app.post('/api/auth/register', async (req,res) => {
   } catch (error) { return handleError(res, error); }
 });
 
-app.post('/api/auth/login', async (req,res) => {
+app.post('/api/auth/login', authLimiter, async (req,res) => {
   try {
     const { email, password } = req.body;
     const { data: user, error } = await supabase
@@ -212,7 +261,9 @@ app.post('/api/auth/login', async (req,res) => {
       .eq('is_active', true)
       .maybeSingle();
     if (error) throw error;
-    if(!user || user.password !== password) return res.status(401).json({ error:'Invalid email or password' });
+    if(!user) return res.status(401).json({ error:'Invalid email or password' });
+    const ok = verifyPassword(password, user.password);
+    if (!ok) return res.status(401).json({ error:'Invalid email or password' });
 
     req.session.user = { id:user.id, name:user.name, email:user.email, role:user.role };
     await logAction(user.id, 'LOGIN', `${user.name} logged in`, req);
@@ -333,8 +384,11 @@ app.delete('/api/cart/:id', requireLogin, async (req,res) => {
 
 app.post('/api/orders/checkout', requireLogin, async (req,res) => {
   try {
-    const { address, city, country, phone, saveAddress, customer_note } = req.body;
+    const { address, city, country, phone, saveAddress, customer_note, payment_method } = req.body;
     if(!address || !city || !phone) return res.status(400).json({ error:'Phone, address and city are required' });
+    const allowedMethods = ['card', 'cod', 'whatsapp'];
+    const payMethod = allowedMethods.includes(String(payment_method || '').toLowerCase()) ? String(payment_method).toLowerCase() : 'card';
+    const paymentStatus = payMethod === 'card' ? 'paid' : 'pending';
 
     const { data: cart, error: cartError } = await supabase
       .from('cart_items')
@@ -358,8 +412,8 @@ app.post('/api/orders/checkout', requireLogin, async (req,res) => {
       total_amount: total,
       currency: 'AED',
       status: 'pending',
-      payment_status: 'paid',
-      payment_method: 'demo',
+      payment_status: paymentStatus,
+      payment_method: payMethod,
       shipping_name: customer?.name || req.session.user.name,
       shipping_phone: phone,
       shipping_address: address,
@@ -368,6 +422,8 @@ app.post('/api/orders/checkout', requireLogin, async (req,res) => {
       customer_note: customer_note || null
     }).select('*').single();
     if (orderError) throw orderError;
+
+    try {
 
     const orderItems = cart.map(item => ({
       order_id: order.id,
@@ -430,7 +486,11 @@ app.post('/api/orders/checkout', requireLogin, async (req,res) => {
     await supabase.from('order_tracking').insert({
       order_id: order.id,
       status: 'pending',
-      message: 'Order placed successfully. Payment confirmed in demo mode.',
+      message: payMethod === 'card'
+        ? 'Order placed successfully. Card payment confirmed.'
+        : payMethod === 'cod'
+          ? 'Order placed successfully. Cash on Delivery selected.'
+          : 'Order placed successfully. Complete payment via WhatsApp.',
       updated_by: req.session.user.id
     });
 
@@ -450,8 +510,22 @@ app.post('/api/orders/checkout', requireLogin, async (req,res) => {
       invoiceId: invoice.id
     });
 
-    await logAction(req.session.user.id, 'ORDER_CREATE', `Order ${order.order_no || '#'+order.id} / ${invoice.invoice_no} created with ${cart.length} item(s), total AED ${Number(total).toFixed(2)}. Confirmation email queued.`, req);
-    req.session.save(err => err ? res.status(500).json({ error:'Session save failed' }) : res.json({ url:`/success?order=${order.id}&demo=true` }));
+      await logAction(req.session.user.id, 'ORDER_CREATE', `Order ${order.order_no || '#'+order.id} / ${invoice.invoice_no} created with ${cart.length} item(s), total AED ${Number(total).toFixed(2)}. Confirmation email queued.`, req);
+      const whatsappBase = process.env.WHATSAPP_PAYMENT_NUMBER || '';
+      let whatsapp_url = null;
+      if (payMethod === 'whatsapp' && whatsappBase) {
+        const msg = encodeURIComponent(`Hi AURA, I want to pay for order ${order.order_no || '#'+order.id}. Total AED ${Number(total).toFixed(2)}.`);
+        whatsapp_url = `https://wa.me/${String(whatsappBase).replace(/[^\d]/g, '')}?text=${msg}`;
+      }
+      req.session.save(err => err ? res.status(500).json({ error:'Session save failed' }) : res.json({ url:`/success?order=${order.id}`, whatsapp_url }));
+    } catch (flowError) {
+      await supabase.from('order_tracking').delete().eq('order_id', order.id);
+      await supabase.from('invoice_items').delete().in('order_item_id', (insertedItems || []).map(i => i.id));
+      await supabase.from('invoices').delete().eq('order_id', order.id);
+      await supabase.from('order_items').delete().eq('order_id', order.id);
+      await supabase.from('orders').delete().eq('id', order.id);
+      throw flowError;
+    }
   } catch (error) { return handleError(res, error); }
 });
 
@@ -519,7 +593,7 @@ app.post('/api/orders/ticket', requireLogin, async (req,res) => {
 });
 
 // Admin Summary/Reports
-app.get('/api/admin/summary', requireLogin, requireAdmin, async (req,res) => {
+app.get('/api/admin/summary', adminLimiter, requireLogin, requireAdmin, async (req,res) => {
   try {
     const [{ data: orders }, { data: products }, { data: customers }, { data: tickets }, { data: logs }] = await Promise.all([
       supabase.from('orders').select('*, customer:users(name,email)').order('created_at', { ascending:false }),
@@ -544,7 +618,7 @@ app.get('/api/admin/summary', requireLogin, requireAdmin, async (req,res) => {
   } catch (error) { return handleError(res, error); }
 });
 
-app.get('/api/admin/reports', requireLogin, requireAdmin, async (req,res) => {
+app.get('/api/admin/reports', adminLimiter, requireLogin, requireAdmin, async (req,res) => {
   try {
     const [{ data: orders }, { data: products }, { data: orderItems }] = await Promise.all([
       supabase.from('orders').select('*'),
