@@ -384,8 +384,11 @@ app.delete('/api/cart/:id', requireLogin, async (req,res) => {
 
 app.post('/api/orders/checkout', requireLogin, async (req,res) => {
   try {
-    const { address, city, country, phone, saveAddress, customer_note } = req.body;
+    const { address, city, country, phone, saveAddress, customer_note, payment_method } = req.body;
     if(!address || !city || !phone) return res.status(400).json({ error:'Phone, address and city are required' });
+    const allowedMethods = ['card', 'cod', 'whatsapp'];
+    const payMethod = allowedMethods.includes(String(payment_method || '').toLowerCase()) ? String(payment_method).toLowerCase() : 'card';
+    const paymentStatus = payMethod === 'card' ? 'paid' : 'pending';
 
     const { data: cart, error: cartError } = await supabase
       .from('cart_items')
@@ -409,8 +412,8 @@ app.post('/api/orders/checkout', requireLogin, async (req,res) => {
       total_amount: total,
       currency: 'AED',
       status: 'pending',
-      payment_status: 'paid',
-      payment_method: 'demo',
+      payment_status: paymentStatus,
+      payment_method: payMethod,
       shipping_name: customer?.name || req.session.user.name,
       shipping_phone: phone,
       shipping_address: address,
@@ -483,7 +486,11 @@ app.post('/api/orders/checkout', requireLogin, async (req,res) => {
     await supabase.from('order_tracking').insert({
       order_id: order.id,
       status: 'pending',
-      message: 'Order placed successfully. Payment confirmed in demo mode.',
+      message: payMethod === 'card'
+        ? 'Order placed successfully. Card payment confirmed.'
+        : payMethod === 'cod'
+          ? 'Order placed successfully. Cash on Delivery selected.'
+          : 'Order placed successfully. Complete payment via WhatsApp.',
       updated_by: req.session.user.id
     });
 
@@ -504,7 +511,13 @@ app.post('/api/orders/checkout', requireLogin, async (req,res) => {
     });
 
       await logAction(req.session.user.id, 'ORDER_CREATE', `Order ${order.order_no || '#'+order.id} / ${invoice.invoice_no} created with ${cart.length} item(s), total AED ${Number(total).toFixed(2)}. Confirmation email queued.`, req);
-      req.session.save(err => err ? res.status(500).json({ error:'Session save failed' }) : res.json({ url:`/success?order=${order.id}&demo=true` }));
+      const whatsappBase = process.env.WHATSAPP_PAYMENT_NUMBER || '';
+      let whatsapp_url = null;
+      if (payMethod === 'whatsapp' && whatsappBase) {
+        const msg = encodeURIComponent(`Hi AURA, I want to pay for order ${order.order_no || '#'+order.id}. Total AED ${Number(total).toFixed(2)}.`);
+        whatsapp_url = `https://wa.me/${String(whatsappBase).replace(/[^\d]/g, '')}?text=${msg}`;
+      }
+      req.session.save(err => err ? res.status(500).json({ error:'Session save failed' }) : res.json({ url:`/success?order=${order.id}`, whatsapp_url }));
     } catch (flowError) {
       await supabase.from('order_tracking').delete().eq('order_id', order.id);
       await supabase.from('invoice_items').delete().in('order_item_id', (insertedItems || []).map(i => i.id));
